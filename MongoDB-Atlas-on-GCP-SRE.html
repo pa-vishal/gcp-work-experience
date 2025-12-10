@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MongoDB Atlas on GCP - SRE Perspective</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+
+<body class="markdown-body">
+  <!-- Theme Toggle Button -->
+  <button class="theme-toggle" onclick="toggleTheme()">Toggle Theme</button>
+
+  <h1>MongoDB Atlas on GCP - SRE Perspective</h1>
+  <div class="summary-block">
+    This overview analyzes MongoDB Atlas on Google Cloud Platform (GCP) through an SRE lens, focusing on architecture, reliability, observability, and infrastructure-as-code.
+  </div>
+
+  <h3 id="1-architectural-network-topology"><strong>1. Architectural & Network Topology</strong></h3>
+
+  <p>From an infrastructure standpoint, Atlas is a fully managed service, but it resides in a "tenant" GCP VPC that is peered or connected to your "consumer" VPC.</p>
+
+  <ul>
+    <li><p><strong>Cluster Composition:</strong></p>
+      <ul>
+        <li><strong>Replica Sets:</strong> The default deployment is a 3-node replica set spread across 3 separate GCP Zones within a single Region for high availability (HA).</li>
+        <li><strong>Sharded Clusters:</strong> For horizontal scaling, Atlas automates sharding (mongos routers + config servers + shard replica sets).</li>
+        <li><strong>Global Clusters:</strong> You can deploy nodes across multiple GCP regions (e.g., <code>us-central1</code>, <code>europe-west1</code>) for low-latency local reads or cross-region DR.</li>
+      </ul>
+    </li>
+    <li><p><strong>Network Connectivity (Critical for SREs):</strong></p>
+      <ul>
+        <li><strong>Private Service Connect (PSC):</strong> <strong>(Recommended)</strong> The modern standard for GCP. It allows unidirectional private connectivity from your VPC to Atlas without the complexity of transitivity issues associated with VPC Peering. It exposes Atlas via a private IP in your subnet.</li>
+        <li><strong>VPC Peering:</strong> The legacy method. It connects the Atlas VPC network directly to yours. <em>Warning:</em> GCP VPC peering is non-transitive. If you peer App VPC ↔ Atlas VPC, you cannot hop from VPN → App VPC → Atlas VPC without a proxy.</li>
+        <li><strong>IP Access Lists:</strong> Functions as a network firewall. Even with peering/PSC, you must whitelist CIDR blocks or specific IPs.</li>
+      </ul>
+    </li>
+  </ul>
+
+  <h3 id="2-reliability-disaster-recovery-dr"><strong>2. Reliability & Disaster Recovery (DR)</strong></h3>
+
+  <p>Atlas handles the heavy lifting of database durability, but SREs own the configuration of that durability.</p>
+
+  <ul>
+    <li><strong>SLA:</strong> 99.995% uptime guarantee for multi-zone clusters.</li>
+    <li><strong>Failover:</strong> Automated election and failover (typically &lt;10 seconds). Drivers automatically handle the topology change if the connection string (SRV record) is used correctly.</li>
+    <li><strong>Backup Strategy:</strong>
+      <ul>
+        <li><strong>Continuous Cloud Backups:</strong> Uses GCP native snapshots. You can enable Point-In-Time Recovery (PITR) to restore to a specific second (usually roughly a 24-hour window).</li>
+        <li><strong>Cross-Region Snapshots:</strong> You can configure backup policies to copy snapshots to a different GCP region (e.g., snapshot in Iowa, copy to Belgium) for region-level DR.</li>
+      </ul>
+    </li>
+    <li><strong>Testing DR:</strong> You can spin up a "clone" of your cluster from a backup into a lower environment (e.g., Staging) to verify data integrity and recovery scripts without impacting production.</li>
+  </ul>
+
+  <h3 id="3-observability-monitoring"><strong>3. Observability & Monitoring</strong></h3>
+
+  <p>This is often the biggest friction point for GCP SREs because Atlas does not "natively" push metrics to Google Cloud Monitoring (formerly Stackdriver) out of the box without configuration.</p>
+
+  <ul>
+    <li><strong>Native Tools:</strong> Atlas UI provides a "Real-Time Performance Panel" (live ops) and "Query Profiler" (identifying slow queries/missing indexes).</li>
+    <li><strong>Google Cloud Monitoring (Stackdriver) Integration:</strong>
+      <ul>
+        <li><strong>Pull Model (Prometheus):</strong> The standard SRE pattern is to use the <strong>Prometheus Integration</strong>. Atlas exposes a metrics endpoint. You can run a <code>mongodb_exporter</code> or configure <strong>Google Cloud Managed Service for Prometheus</strong> to scrape this endpoint.</li>
+        <li><strong>Push Model (Custom):</strong> Alternatively, you can write a small serverless function (Cloud Run/Functions) that polls the Atlas Administration API and pushes custom metrics to Cloud Monitoring, but this adds maintenance overhead.</li>
+      </ul>
+    </li>
+    <li><strong>Logs:</strong> You can push MongoDB logs (audit, error, etc.) to a Google Cloud Storage bucket or directly to <strong>Cloud Logging</strong> via an export configuration.</li>
+  </ul>
+
+  <h3 id="4-security-compliance"><strong>4. Security & Compliance</strong></h3>
+
+  <ul>
+    <li><strong>Encryption:</strong>
+      <ul>
+        <li><strong>In-Transit:</strong> TLS 1.2+ is mandatory.</li>
+        <li><strong>At-Rest:</strong> Encrypted by default using Google's internal keys.</li>
+        <li><strong>Customer Managed Keys (CMK):</strong> You can use <strong>Google Cloud KMS</strong> to hold the master encryption key (MEK) if you have strict compliance requirements (e.g., HIPAA, PCI).</li>
+      </ul>
+    </li>
+    <li><strong>Authentication:</strong>
+      <ul>
+        <li><strong>IAM:</strong> Supports "Database Users" (built-in) or peering with LDAP/OIDC.</li>
+        <li><strong>GCP Service Accounts:</strong> You can federate GCP Service Account identity to manage Atlas resources (via the Atlas API), reducing the need for long-lived API keys.</li>
+      </ul>
+    </li>
+  </ul>
+
+  <h3 id="5-infrastructure-as-code-terraform"><strong>5. Infrastructure as Code (Terraform)</strong></h3>
+
+  <p>Managing Atlas via ClickOps (UI) is an anti-pattern for SREs. Use the official Terraform Provider (<code>mongodb/mongodbatlas</code>).</p>
+
+  <p><strong>Key Resources:</strong></p>
+
+  <ul>
+    <li><code>mongodbatlas_cluster</code>: Defines instance size (e.g., <code>M10</code>, <code>M30</code>), region, and disk auto-scaling settings.</li>
+    <li><code>mongodbatlas_privatelink_endpoint</code>: Manages the GCP Private Service Connect setup.</li>
+    <li><code>mongodbatlas_database_user</code>: Manages DB credentials programmatically (can rotate these via Vault or Secret Manager).</li>
+  </ul>
+
+  <p><strong>Example Snippet (PSC Setup):</strong></p>
+
+  <pre><code class="lang-hcl">resource <span class="hljs-string">"mongodbatlas_privatelink_endpoint"</span> <span class="hljs-string">"atlas_psc"</span> {
+  <span class="hljs-attr">project_id</span>    = var.atlas_project_id
+  <span class="hljs-attr">provider_name</span> = <span class="hljs-string">"GCP"</span>
+  <span class="hljs-attr">region</span>        = <span class="hljs-string">"us-central1"</span>
+}
+
+<span class="hljs-comment"># Note: You then have to create a Google Compute Forwarding Rule</span>
+<span class="hljs-comment"># pointing to the service attachment provided by the resource above.</span>
+</code></pre>
+
+  <h3 id="6-sre-gotchas-best-practices"><strong>6. SRE "Gotchas" & Best Practices</strong></h3>
+
+  <table>
+    <thead>
+      <tr>
+        <th style="text-align:left">Area</th>
+        <th style="text-align:left">Best Practice</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="text-align:left"><strong>Cost</strong></td>
+        <td style="text-align:left">Enable <strong>Auto-Scaling</strong> for storage (disk grows automatically) but be careful with <em>downscaling</em> (often manual). Monitor <code>Disk IOPS</code> as higher tiers (M30+) act differently than lower tiers.</td>
+      </tr>
+      <tr>
+        <td style="text-align:left"><strong>Connection</strong></td>
+        <td style="text-align:left">Always use the <strong>SRV Connection String</strong> (<code>mongodb+srv://...</code>). This abstracts the node IPs, allowing Atlas to replace/rotate nodes without breaking app config.</td>
+      </tr>
+      <tr>
+        <td style="text-align:left"><strong>Bursting</strong></td>
+        <td style="text-align:left">Standard GCP persistent disks have I/O limits. If you anticipate spiky traffic, ensure your chosen instance size (<code>M-tier</code>) supports the required IOPS, or you will see high <code>IOWait</code>.</td>
+      </tr>
+      <tr>
+        <td style="text-align:left"><strong>Version</strong></td>
+        <td style="text-align:left">Set the <code>mongo_db_major_version</code> in Terraform. Do not let it "float" to avoid unexpected major version upgrades during maintenance windows.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="watermark">Vishal Patil</div>
+
+  <script>
+    // Theme Management Script
+    (function() {
+      // Function to load CSS dynamically
+      function loadCSS(href, id) {
+        // Remove existing CSS if it exists
+        const existingCSS = document.getElementById(id);
+        if (existingCSS) {
+          existingCSS.remove();
+        }
+        
+        // Create new link element
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.type = 'text/css';
+        link.href = href;
+        link.id = id;
+        document.head.appendChild(link);
+      }
+      
+      // Check for saved theme preference or default to 'light'
+      const currentTheme = localStorage.getItem('theme') || 'light';
+      
+      // Apply the saved theme
+      document.documentElement.setAttribute('data-theme', currentTheme);
+      
+      // Load appropriate CSS based on theme
+      if (currentTheme === 'dark') {
+        loadCSS('https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-dark.min.css', 'github-markdown-css');
+      } else {
+        loadCSS('https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-light.min.css', 'github-markdown-css');
+      }
+      
+      // Theme toggle function
+      window.toggleTheme = function() {
+        const currentTheme = document.documentElement.getAttribute('data-theme');
+        const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+        
+        // Update the theme
+        document.documentElement.setAttribute('data-theme', newTheme);
+        
+        // Save the preference
+        localStorage.setItem('theme', newTheme);
+        
+        // Load appropriate CSS
+        if (newTheme === 'dark') {
+          loadCSS('https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-dark.min.css', 'github-markdown-css');
+        } else {
+          loadCSS('https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown-light.min.css', 'github-markdown-css');
+        }
+        
+        // Update Mermaid diagrams if they exist
+        if (typeof mermaid !== 'undefined') {
+          mermaid.initialize({ 
+            startOnLoad: false,
+            theme: newTheme === 'dark' ? 'dark' : 'default'
+          });
+          // Re-render all mermaid diagrams
+          mermaid.init();
+        }
+      };
+      
+      // Initialize Mermaid with correct theme
+      if (typeof mermaid !== 'undefined') {
+        mermaid.initialize({ 
+          startOnLoad: true,
+          theme: currentTheme === 'dark' ? 'dark' : 'default'
+        });
+      }
+    })();
+  </script>
+</body>
+</html>
